@@ -11,3 +11,7 @@ __pycache__/
 examples/media/
 !examples/requests_A.jsonl
 !examples/requests_B.jsonl
+
+/input/
+/streamrender-h3-examples.tar
+*.py.before_*

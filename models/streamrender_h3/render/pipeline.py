@@ -62,7 +62,13 @@ class StreamingPipeline:
 
     @torch.inference_mode()
     def start(self, *, prompt, picture, seed):
+        import gc
+        self.states = None
+        self.encoder = None
+        self.decoder = None
         STATE.reset()
+        gc.collect()
+        torch.cuda.empty_cache()
         meta = self.meta
         if not meta.qwen_visual_context or meta.qwen_reference_video:
             raise ValueError("This deployment requires static prompt+picture Qwen conditioning")
@@ -71,8 +77,16 @@ class StreamingPipeline:
             self.models, {"picture": picture}, height=output["height"],
             width=output["width"], seed=seed)
         meta._stream_pictures = [picture_rows]
-        meta._stream_qwen_contexts = meta._validation_qwen_contexts(
-            self.models, [prompt], None, [picture_rows])
+        conditioning_key = (prompt, str(picture), int(seed),
+                            output["height"], output["width"])
+        if getattr(self, "_h3_conditioning_key", None) != conditioning_key:
+            self._h3_qwen_contexts = meta._validation_qwen_contexts(
+                self.models, [prompt], None, [picture_rows])
+            self._h3_conditioning_key = conditioning_key
+            print(f"H3_QWEN_PREPARED rank={self.rank}", flush=True)
+        else:
+            print(f"H3_QWEN_REUSED rank={self.rank}", flush=True)
+        meta._stream_qwen_contexts = self._h3_qwen_contexts
         self.states = meta.start_stream(
             prompt_embeds=[torch.empty((0, 0), device=self.device)],
             video_geometries=[(24, output["height"] // 16, output["width"] // 16)],

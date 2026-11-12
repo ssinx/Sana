@@ -290,7 +290,8 @@ class StreamingPrefixForwardMixin:
             merged = merge_streaming_prefix_caches(
                 caches, padding=self._sp_size() > 1
             )
-            if merged._persistent_key_arenas is None:
+            if (merged._persistent_key_arenas is None
+                    and os.environ.get("H3_DISABLE_PERSISTENT_KV", "0") != "1"):
                 merged.prepare_persistent_attention_arenas(
                     int(os.environ.get("H3_CACHE_QUERY_CAPACITY", "12288"))
                 )

@@ -1,0 +1,7 @@
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+triton==3.5.1
+flash-attn-4==4.0.0b34
+nvidia-cutlass-dsl==4.8.0
+quack-kernels==0.6.5

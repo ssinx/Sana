@@ -9,6 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from .archive import SessionArchive
 from .config import ROOT, load_config, mount_vendor
 from .server import Bridge, serve
 
@@ -36,10 +37,15 @@ def run_h3(settings, assets, bridge):
     init_unified_parallel((1, world), 1)
     rank = dist.get_rank()
     models = build_models(cfg.models)
+    if rank != 0:
+        models["video_decoder"].to("cpu")
+        torch.cuda.empty_cache()
+        logging.info("Rank %s: unused video decoder moved to CPU", rank)
     if len(models["backbone"].dit.blocks) != 50:
         raise RuntimeError("The H3 backbone must execute all 50 layers")
     pipe = StreamingPipeline(cfg, models, settings)
     outputs = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rgb-publication")
+    archive = SessionArchive(settings, ROOT) if rank == 0 else None
 
     def publish(session, tensor, metrics):
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
@@ -49,6 +55,7 @@ def run_h3(settings, assets, bridge):
             out = io.BytesIO()
             Image.fromarray(frame).save(out, format="JPEG", quality=85)
             images.append(out.getvalue())
+        archive.save_rendered(session, images)
         while not session.closed:
             try:
                 session.outputs.put((images, metrics), timeout=.5)
@@ -62,7 +69,26 @@ def run_h3(settings, assets, bridge):
         return data[0]
 
     # Warm identical bootstrap/continuation shapes, then discard all stream state.
-    with execution_phase(ExecutionPhase.VALIDATION), use_unified_parallel(world):
+    from contextlib import contextmanager
+    import faulthandler
+
+    @contextmanager
+    def h3_hang_debug():
+        folder = ROOT / "outputs" / "hang-debug"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"rank{rank}-pid{os.getpid()}.log"
+        with path.open("w") as handle:
+            logging.info("H3_STACK_LOG rank=%s path=%s", rank, path)
+            faulthandler.dump_traceback_later(60, repeat=True, file=handle)
+            try:
+                yield
+            except BaseException:
+                logging.exception("H3_WORKER_EXCEPTION rank=%s", rank)
+                raise
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+
+    with execution_phase(ExecutionPhase.VALIDATION), use_unified_parallel(world), h3_hang_debug():
         pipe.start(prompt=assets["prompt"], picture=assets["reference_image"], seed=cfg.seed)
         for _ in range(settings["warmup_rounds"]):
             _, frames = pipe.next_counts()
@@ -75,12 +101,42 @@ def run_h3(settings, assets, bridge):
             print("STREAMRENDER_READY", json.dumps({"gpus": world, "layers": 50, "nfe": 2}), flush=True)
         while True:
             session = bridge.starts.get() if rank == 0 else None
-            header = broadcast(({"stop": True} if session is None else
-                                {"id": session.id, "seed": cfg.seed}) if rank == 0 else None)
+            header = broadcast(
+                (
+                    {'stop': True}
+                    if session is None
+                    else {
+                        'id': session.id,
+                        'seed': session.config.get('seed', cfg.seed),
+                        'prompt': session.config.get('prompt', assets['prompt']),
+                        'reference_image': session.config.get(
+                            'reference_image',
+                            assets['reference_image'],
+                        ),
+                        'input_mode': session.config.get(
+                            'input_mode',
+                            'semantic',
+                        ),
+                    }
+                )
+                if rank == 0
+                else None
+            )
+
             if header.get("stop"):
                 outputs.shutdown(wait=True)
+                if archive is not None:
+                    archive.shutdown()
                 return
-            pipe.start(prompt=assets["prompt"], picture=assets["reference_image"], seed=header["seed"])
+            if rank == 0:
+                archive.start(session)
+            logging.info("H3_SESSION_PREP_BEGIN rank=%s", rank)
+            pipe.start(
+                prompt=header["prompt"],
+                picture=header["reference_image"],
+                seed=header["seed"],
+            )
+            logging.info("H3_SESSION_PREP_DONE rank=%s", rank)
             if rank == 0:
                 session.ready = True
             pending_output = None
@@ -91,13 +147,34 @@ def run_h3(settings, assets, bridge):
                                    [(item[0], item[1]) for item in records] if rank == 0 else None)
                 if packet is None:
                     break
+                if rank == 0:
+                    archive.save_semantic(session, records)
                 arrays = [np.array(Image.open(io.BytesIO(png)).convert("RGB")) for _, png in packet]
                 pixels = torch.from_numpy(np.stack(arrays)).to(pipe.device).permute(3, 0, 1, 2).float().div_(255)
                 # Semantic palette labels must not be bilinearly blended.
-                pixels = torch.nn.functional.interpolate(
-                    pixels.permute(1, 0, 2, 3),
-                    size=(settings["reference"]["height"], settings["reference"]["width"]),
-                    mode="nearest").permute(1, 0, 2, 3).contiguous()
+                batch = pixels.permute(1, 0, 2, 3)
+
+                if header['input_mode'] == 'rgb':
+                    batch = torch.nn.functional.interpolate(
+                        batch,
+                        size=(
+                            settings['reference']['height'],
+                            settings['reference']['width'],
+                        ),
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                else:
+                    batch = torch.nn.functional.interpolate(
+                        batch,
+                        size=(
+                            settings['reference']['height'],
+                            settings['reference']['width'],
+                        ),
+                        mode='nearest',
+                    )
+
+                pixels = batch.permute(1, 0, 2, 3).contiguous()
                 rgb, metrics = pipe.render(pixels)
                 if rank == 0:
                     metrics["session"] = session.id
@@ -105,7 +182,7 @@ def run_h3(settings, assets, bridge):
                     metrics["reference_last_frame"] = records[-1][0]
                     metrics["oldest_input_to_rgb_ready_ms"] = (time.monotonic() - records[0][3]) * 1000
                     session.metrics = metrics
-                    output_dir = Path(settings.get("output_dir", str(ROOT / "outputs"))) / session.id
+                    output_dir = archive.session_dir(session)
                     output_dir.mkdir(parents=True, exist_ok=True)
                     with (output_dir / "controls.jsonl").open("a") as transcript:
                         for frame_index, _, controls, _ in records:
@@ -121,6 +198,8 @@ def run_h3(settings, assets, bridge):
                         pending_output = outputs.submit(publish, session, rgb, metrics)
             if pending_output is not None:
                 pending_output.result()
+            if rank == 0:
+                archive.finish(session)
             # Reset all encoder/decoder/KV state on the next start().
 
 

@@ -71,7 +71,7 @@ class StreamingCausalViT(nn.Module):
         self.nslot = r.cache_latents + r.chunk
         self.S = r.register_tokens.shape[1] + 1
         dev = r.register_tokens.device
-        self.blocks = copy.deepcopy(r.blocks)
+        self.blocks = r.blocks  # Reuse blocks for streaming inference.
         for m in self.blocks.modules():
             if isinstance(m, nn.Linear):
                 m.to(BF16)

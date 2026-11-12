@@ -1,4 +1,5 @@
 """Feed a prerecorded semantic example to an already warm HTTP worker."""
+from PIL import Image
 import argparse
 import io
 import json
@@ -15,18 +16,66 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--example', default=DEFAULT)
     parser.add_argument('--media-root', default=str(ROOT))
+    parser.add_argument('--video')
     parser.add_argument('--server', default='http://127.0.0.1:8765')
     parser.add_argument('--max-frames', type=int, default=0)
     parser.add_argument('--output', default=str(ROOT / 'outputs/replay'))
+    parser.add_argument("--prompt-file", required=True)
+    parser.add_argument("--reference-image", required=True)
+    parser.add_argument("--seed", type=int, default=1024)
+    parser.add_argument("--experiment", required=True)
+    parser.add_argument(
+        '--input-mode',
+        choices=('rgb', 'semantic'),
+        default='rgb',
+    )
     args = parser.parse_args()
     row = next(r for r in example_requests() if r['name'] == args.example)
-    source = Path(args.media_root) / row['reference_video_path']
+    source = (Path(args.video).expanduser().resolve() if args.video
+              else Path(args.media_root) / row['reference_video_path'])
+    if not source.is_file():
+        raise FileNotFoundError(source)
     server = args.server.rstrip('/')
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    response = requests.post(server + '/session', json={k: row[k] for k in ('fps', 'height', 'width')}, timeout=30)
+    prompt_file = Path(args.prompt_file).expanduser().resolve()
+    reference_image = Path(args.reference_image).expanduser().resolve()
+
+    if not prompt_file.is_file():
+        raise FileNotFoundError(prompt_file)
+
+    if not reference_image.is_file():
+        raise FileNotFoundError(reference_image)
+
+    session_config = {
+        'fps': 24,
+        'height': 768,
+        'width': 1344,
+        'prompt': prompt_file.read_text(encoding='utf-8'),
+        'reference_image': str(reference_image),
+        'seed': args.seed,
+        'experiment': args.experiment,
+        'input_mode': args.input_mode,
+    }
+
+    response = requests.post(
+        server + '/session',
+        json=session_config,
+        timeout=30,
+    )
     response.raise_for_status()
     session = response.json()['id']
+
+    request_record = {
+        **session_config,
+        'session': session,
+        'video': str(source),
+    }
+
+    (output / f'{session}.request.json').write_text(
+        json.dumps(request_record, indent=2, ensure_ascii=True) + '\n',
+        encoding='utf-8',
+    )
     stop = threading.Event()
     errors = []
     count = [0]
@@ -75,11 +124,20 @@ def main():
                 raise TimeoutError('Session preparation timed out')
             time.sleep(.5)
         with av.open(str(source)) as container:
-            limit = args.max_frames or row['num_frames']
+            limit = args.max_frames or (row['num_frames'] if not args.video else 10**18)
             for frame in container.decode(video=0):
                 if sent >= limit:
                     break
-                image = frame.to_image().resize((row['width'], row['height']), resample=0)
+                resample = (
+                    Image.Resampling.LANCZOS
+                    if args.input_mode == 'rgb'
+                    else Image.Resampling.NEAREST
+                )
+
+                image = frame.to_image().resize(
+                    (row['width'], row['height']),
+                    resample=resample,
+                )
                 payload = io.BytesIO()
                 image.save(payload, format='PNG')
                 deadline = time.monotonic() + 120
@@ -90,7 +148,7 @@ def main():
                                              headers={'Content-Type': 'image/png',
                                                       'X-Controls': json.dumps({'frame': sent,
                                                                                'source': 'prerecorded',
-                                                                               'example': row['name']})}, timeout=60)
+                                                                               'example': args.experiment})}, timeout=60)
                     if response.status_code != 429:
                         response.raise_for_status()
                         break
@@ -110,8 +168,13 @@ def main():
             time.sleep(.2)
         if not count[0]:
             raise RuntimeError('No rendered feedback received')
-        print(json.dumps({'session': session, 'example': row['name'], 'input_frames': sent,
-                          'saved_rgb_frames': count[0], 'output': str(output.resolve())}))
+        print(json.dumps({
+            'session': session,
+            'experiment': args.experiment,
+            'input_frames': sent,
+            'saved_rgb_frames': count[0],
+            'output': str(output.resolve()),
+        }))
     finally:
         stop.set()
         requests.post(server + '/close/' + session, data=b'{}', timeout=30)
